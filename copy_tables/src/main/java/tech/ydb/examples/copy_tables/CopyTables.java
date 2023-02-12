@@ -10,6 +10,7 @@ import tech.ydb.table.SessionRetryContext;
 import tech.ydb.table.TableClient;
 import tech.ydb.table.description.TableDescription;
 import tech.ydb.table.query.Params;
+import tech.ydb.table.settings.CopyTablesSettings;
 import tech.ydb.table.transaction.TxControl;
 import tech.ydb.table.values.ListValue;
 import tech.ydb.table.values.PrimitiveType;
@@ -17,6 +18,11 @@ import tech.ydb.table.values.PrimitiveValue;
 import tech.ydb.table.values.StructValue;
 import tech.ydb.table.values.Value;
 
+/**
+ * This example creates 3 tables, fills those tables with test records,
+ * and creates a snapshot-style copy of all those tables.
+ * @author zinal
+ */
 public class CopyTables implements App {
     private static final String TABLE1_NAME = "table1";
     private static final String TABLE2_NAME = "table2";
@@ -30,6 +36,119 @@ public class CopyTables implements App {
         this.databasePath = databasePath;
         this.tableClient = TableClient.newClient(transport).build();
         this.retryCtx = SessionRetryContext.create(tableClient).build();
+    }
+
+    @Override
+    public void run() {
+        createTables();
+        insertData();
+        copyTables();
+        dropTables();
+    }
+
+    private void createTable(String tableName, TableDescription tableDesc) {
+        Status status = retryCtx.supplyStatus(session ->
+                session.createTable(databasePath + "/" + tableName, tableDesc)).join();
+        if (status != Status.SUCCESS) {
+            System.out.println(String.format("Table %s creation failed with status: %s", tableName, status));
+        } else {
+            System.out.println(String.format("Table %s created", tableName));
+        }
+    }
+
+    private void createTables() {
+        TableDescription tableDesc = TableDescription.newBuilder()
+                .addNullableColumn("a", PrimitiveType.Uint64)
+                .addNullableColumn("b", PrimitiveType.Uint64)
+                .addNullableColumn("c", PrimitiveType.Text)
+                .addNullableColumn("d", PrimitiveType.Text)
+                .setPrimaryKeys("a", "b")
+                .build();
+        createTable(TABLE1_NAME, tableDesc);
+        createTable(TABLE2_NAME, tableDesc);
+        createTable(TABLE3_NAME, tableDesc);
+    }
+
+    private void dropTable(String tableName) {
+        Status status = retryCtx.supplyStatus(session ->
+                session.dropTable(databasePath + "/" + tableName)).join();
+        if (status != Status.SUCCESS) {
+            System.out.println(String.format("Table %s removal failed with status: %s", tableName, status));
+        } else {
+            System.out.println(String.format("Table %s dropped", tableName));
+        }
+    }
+
+    private void dropTables() {
+        dropTable(TABLE1_NAME);
+        dropTable(TABLE2_NAME);
+        dropTable(TABLE3_NAME);
+        dropTable(TABLE1_NAME + "_copy");
+        dropTable(TABLE2_NAME + "_copy");
+        dropTable(TABLE3_NAME + "_copy");
+    }
+
+    private void executeBatch(String query, ArrayList<Value<?>> pack) {
+        Value<?>[] values = new Value<?>[pack.size()];
+        pack.toArray(values);
+
+        Params params = Params.of("$items", ListValue.of(values));
+
+        TxControl txControl = TxControl.serializableRw().setCommitTx(true);
+        retryCtx
+                .supplyResult(session -> session.executeDataQuery(query, txControl, params))
+                .join().getStatus().expectSuccess();
+    }
+
+    private void insertData(String tableName, int recordCount) {
+        String query = String.format(
+            "\n" +
+            "DECLARE $items AS\n" +
+            "List<Struct<\n" +
+                "a: Uint64,\n" +
+                "b: Uint64,\n" +
+                "c: Utf8,\n" +
+                "d: Utf8>>;\n" +
+            "REPLACE INTO `%s`\n" +
+            "SELECT * FROM AS_TABLE($items)\n", tableName);
+
+        final Generator input = new Generator(recordCount);
+
+        while (input.isValid()) {
+            ArrayList<Value<?>> pack = new ArrayList<>();
+            while (input.isValid() && pack.size() < 101) {
+                pack.add(input.get());
+            }
+            executeBatch(query, pack);
+        }
+        System.out.println(String.format("%d records uploaded to %s", recordCount, tableName));
+    }
+
+    private void insertData() {
+        insertData(TABLE1_NAME, 10);
+        insertData(TABLE2_NAME, 100);
+        insertData(TABLE3_NAME, 1000);
+    }
+
+    private void copyTables() {
+        final CopyTablesSettings copyTables = new CopyTablesSettings();
+        copyTables.addTable(TABLE1_NAME, TABLE1_NAME + "_copy");
+        copyTables.addTable(TABLE2_NAME, TABLE2_NAME + "_copy");
+        copyTables.addTable(TABLE3_NAME, TABLE3_NAME + "_copy");
+        retryCtx.supplyStatus(session -> session.copyTables(copyTables)).join().expectSuccess();
+    }
+
+    @Override
+    public void close() {
+        tableClient.close();
+    }
+
+    public static int test(String[] args) {
+        return AppRunner.safeRun("CopyTables", CopyTables::new, args);
+    }
+
+    public static void main(String[] args) {
+        AppRunner.run("CopyTables", CopyTables::new, args);
     }
 
     static class Generator {
@@ -65,119 +184,5 @@ public class CopyTables implements App {
                     "d", PrimitiveValue.newText(page)
             );
         }
-    }
-
-    @Override
-    public void run() {
-        createTables();
-        insertData(TABLE1_NAME, 10);
-        insertData(TABLE2_NAME, 100);
-        insertData(TABLE3_NAME, 1000);
-        dropTables();
-    }
-
-    private void createTables() {
-        TableDescription tableDesc = TableDescription.newBuilder()
-                .addNullableColumn("a", PrimitiveType.Uint64)
-                .addNullableColumn("b", PrimitiveType.Uint64)
-                .addNullableColumn("c", PrimitiveType.Text)
-                .addNullableColumn("d", PrimitiveType.Text)
-                .setPrimaryKeys("a", "b")
-                .build();
-
-        Status status = retryCtx.supplyStatus(session -> 
-                session.createTable(databasePath + "/" + TABLE1_NAME, tableDesc)).join();
-        if (status != Status.SUCCESS) {
-            System.out.println(String.format("Table 1 creation failed with status: %s", status));
-        } else {
-            System.out.println("Table 1 created");
-        }
-        status = retryCtx.supplyStatus(session ->
-                session.createTable(databasePath + "/" + TABLE2_NAME, tableDesc)).join();
-        if (status != Status.SUCCESS) {
-            System.out.println(String.format("Table 2 creation failed with status: %s", status));
-        } else {
-            System.out.println("Table 2 created");
-        }
-        status = retryCtx.supplyStatus(session ->
-                session.createTable(databasePath + "/" + TABLE3_NAME, tableDesc)).join();
-        if (status != Status.SUCCESS) {
-            System.out.println(String.format("Table 3 creation failed with status: %s", status));
-        } else {
-            System.out.println("Table 3 created");
-        }
-    }
-
-    private void dropTables() {
-        Status status = retryCtx.supplyStatus(session ->
-                session.dropTable(databasePath + "/" + TABLE1_NAME)).join();
-        if (status != Status.SUCCESS) {
-            System.out.println(String.format("Table 1 removal failed with status: %s", status));
-        } else {
-            System.out.println("Table 1 dropped");
-        }
-        status = retryCtx.supplyStatus(session ->
-                session.dropTable(databasePath + "/" + TABLE2_NAME)).join();
-        if (status != Status.SUCCESS) {
-            System.out.println(String.format("Table 2 removal failed with status: %s", status));
-        } else {
-            System.out.println("Table 2 dropped");
-        }
-        status = retryCtx.supplyStatus(session ->
-                session.dropTable(databasePath + "/" + TABLE3_NAME)).join();
-        if (status != Status.SUCCESS) {
-            System.out.println(String.format("Table 3 removal failed with status: %s", status));
-        } else {
-            System.out.println("Table 3 dropped");
-        }
-    }
-
-    private void insertData(String tableName, int recordCount) {
-        String query = String.format(
-            "\n" +
-            "DECLARE $items AS\n" +
-            "List<Struct<\n" +
-                "a: Uint64,\n" +
-                "b: Uint64,\n" +
-                "c: Utf8,\n" +
-                "d: Utf8>>;\n" +
-            "REPLACE INTO `%s`\n" +
-            "SELECT * FROM AS_TABLE($items)\n", tableName);
-
-        final Generator input = new Generator(recordCount);
-
-        while (input.isValid()) {
-            ArrayList<Value<?>> pack = new ArrayList<>();
-            while (input.isValid() && pack.size() < 101) {
-                pack.add(input.get());
-            }
-            executeBatch(query, pack);
-        }
-        System.out.println(String.format("%d records uploaded to %s", recordCount, tableName));
-    }
-
-    private void executeBatch(String query, ArrayList<Value<?>> pack) {
-        Value<?>[] values = new Value<?>[pack.size()];
-        pack.toArray(values);
-
-        Params params = Params.of("$items", ListValue.of(values));
-
-        TxControl txControl = TxControl.serializableRw().setCommitTx(true);
-        retryCtx
-                .supplyResult(session -> session.executeDataQuery(query, txControl, params))
-                .join().getStatus().expectSuccess("expected success result");
-    }
-
-    @Override
-    public void close() {
-        tableClient.close();
-    }
-
-    public static int test(String[] args) {
-        return AppRunner.safeRun("CopyTables", CopyTables::new, args);
-    }
-
-    public static void main(String[] args) {
-        AppRunner.run("CopyTables", CopyTables::new, args);
     }
 }
